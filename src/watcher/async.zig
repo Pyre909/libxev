@@ -549,6 +549,31 @@ fn AsyncIOCP(comptime xev: type) type {
                 loop: *xev.Loop,
                 c: *xev.Completion,
             } = null,
+
+            /// Make c the waiter. A notify that arrived while there was none
+            /// is delivered to it now, once.
+            fn register(state: *State, loop: *xev.Loop, c: *xev.Completion) void {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                state.guard.lockUncancelable(io);
+                defer state.guard.unlock(io);
+
+                state.waiter = .{ .loop = loop, .c = c };
+                if (state.wakeup) {
+                    state.wakeup = false;
+                    loop.async_notify(c);
+                }
+            }
+
+            /// Stop sending notifications to c, if it is still the waiter.
+            fn release(state: *State, c: *xev.Completion) void {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                state.guard.lockUncancelable(io);
+                defer state.guard.unlock(io);
+
+                if (state.waiter) |w| {
+                    if (w.c == c) state.waiter = null;
+                }
+            }
         };
 
         const allocator = std.heap.smp_allocator;
@@ -578,7 +603,7 @@ fn AsyncIOCP(comptime xev: type) type {
             ) xev.CallbackAction,
         ) void {
             c.* = .{
-                .op = .{ .async_wait = .{} },
+                .op = .{ .async_wait = .{ .owner = self.state } },
                 .userdata = userdata,
                 .callback = (struct {
                     fn callback(
@@ -587,28 +612,26 @@ fn AsyncIOCP(comptime xev: type) type {
                         c_inner: *xev.Completion,
                         r: xev.Result,
                     ) xev.CallbackAction {
-                        return @call(.always_inline, cb, .{
+                        // While the callback runs, a notify is kept for the
+                        // next wait rather than sent to this completion,
+                        // which the callback may disarm or reuse.
+                        const state: *State = @ptrCast(@alignCast(
+                            c_inner.op.async_wait.owner.?,
+                        ));
+                        state.release(c_inner);
+                        const action = @call(.always_inline, cb, .{
                             common.userdataValue(Userdata, ud),
                             l_inner,
                             c_inner,
                             if (r.async_wait) |_| {} else |err| err,
                         });
+                        if (action == .rearm) state.register(l_inner, c_inner);
+                        return action;
                     }
                 }).callback,
             };
             loop.add(c);
-
-            const io = std.Io.Threaded.global_single_threaded.io();
-            const state = self.state;
-            state.guard.lockUncancelable(io);
-            defer state.guard.unlock(io);
-
-            state.waiter = .{
-                .loop = loop,
-                .c = c,
-            };
-
-            if (state.wakeup) loop.async_notify(c);
+            self.state.register(loop, c);
         }
 
         pub fn notify(self: *Self) !void {
@@ -885,6 +908,89 @@ fn AsyncTests(comptime xev: type, comptime Impl: type) type {
             try loop.run(.once);
             for (0..10) |_| try loop.run(.no_wait);
             try testing.expectEqual(@as(u32, 1), count);
+        }
+
+        test "async: a notify wakes one wait, not the next" {
+            const testing = std.testing;
+
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var notifier = try Impl.init();
+            defer notifier.deinit();
+
+            const callback = (struct {
+                fn callback(
+                    ud: ?*u32,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    r: Impl.WaitError!void,
+                ) xev.CallbackAction {
+                    _ = r catch unreachable;
+                    ud.?.* += 1;
+                    return .disarm;
+                }
+            }).callback;
+
+            try notifier.notify();
+
+            var count: u32 = 0;
+            var c_wait: xev.Completion = .{};
+            notifier.wait(&loop, &c_wait, u32, &count, callback);
+            try loop.run(.until_done);
+            try testing.expectEqual(@as(u32, 1), count);
+
+            // Nothing was notified since, so this wait must not fire.
+            notifier.wait(&loop, &c_wait, u32, &count, callback);
+            for (0..10) |_| try loop.run(.no_wait);
+            try testing.expectEqual(@as(u32, 1), count);
+        }
+
+        test "async: a notify between waits wakes the next wait" {
+            const testing = std.testing;
+
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var notifier = try Impl.init();
+            defer notifier.deinit();
+
+            const callback = (struct {
+                fn callback(
+                    ud: ?*u32,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    r: Impl.WaitError!void,
+                ) xev.CallbackAction {
+                    _ = r catch unreachable;
+                    ud.?.* += 1;
+                    return .disarm;
+                }
+            }).callback;
+
+            var count: u32 = 0;
+            var c_wait: xev.Completion = .{};
+            notifier.wait(&loop, &c_wait, u32, &count, callback);
+            try notifier.notify();
+            try loop.run(.until_done);
+            try testing.expectEqual(@as(u32, 1), count);
+
+            // Notified while nothing waits: the next wait must fire.
+            try notifier.notify();
+            notifier.wait(&loop, &c_wait, u32, &count, callback);
+
+            // Polled rather than run(.until_done), which would block forever
+            // if the notification were lost.
+            for (0..100) |_| {
+                try loop.run(.no_wait);
+                if (count == 2) break;
+                std.Io.sleep(
+                    std.Io.Threaded.global_single_threaded.io(),
+                    .fromMilliseconds(1),
+                    .awake,
+                ) catch unreachable;
+            }
+            try testing.expectEqual(@as(u32, 2), count);
         }
     };
 }

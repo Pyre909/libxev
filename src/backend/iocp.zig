@@ -1335,6 +1335,9 @@ pub const Operation = union(OperationType) {
 
     async_wait: struct {
         wakeup: std.atomic.Value(bool) = .{ .raw = false },
+
+        /// The state of the Async that is waiting (watcher/async.zig).
+        owner: ?*anyopaque = null,
     },
 
     job_object: struct {
